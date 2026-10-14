@@ -285,3 +285,42 @@ test('old checkpoints preserve lists and reviews while requiring a full ban chec
   state.cursor = 1;
   assert.equal(upgradeScan(state), false); assert.equal(state.cursor, 1);
 });
+
+test('404 is skippable only when explicitly allowed; limits and other failures still stop', () => {
+  const responses = [{ status: 404, responseText: '<html>missing</html>' },
+    { status: 200, responseText: '{"code":-404}' }, { status: 200, responseText: '{"code":404}' }];
+  for (const response of responses) {
+    assert.deepEqual(parseResponse(response, false, true), { unavailable: true });
+    assert.throws(() => parseResponse(response));
+  }
+  assert.throws(() => parseResponse({ status: 412, responseText: '{}' }, false, true), /412/);
+  assert.throws(() => parseResponse({ status: 500, responseText: '{"code":-404}' }, false, true), /500/);
+  assert.throws(() => parseResponse({ status: 200, responseText: '{"code":-352}' }, false, true), /352/);
+});
+
+test('404 results advance serial and parallel checkpoints without becoming removal candidates', async () => {
+  for (const concurrency of [1, 2]) {
+    const state = freshState('123'); state.rows = ['456', '457', '458'].map(mid => ({ mid, attribute: 2, special: 0, review: 'remove' }));
+    let saves = 0;
+    await scanRows(state, concurrency, { checkStop() {}, stop(e) { throw e; }, progress() {},
+      save: async () => { saves++; }, inspect: row => inspectRow(row, state, {
+        account: async mid => mid === '456' ? { unavailable: true } : { banned: false, banChecked: Date.now() },
+        video: async mid => mid === '457' ? { status: 'unavailable', latest: null } : { status: 'inactive', latest: oldDate }
+      }) });
+    state.complete = true;
+    assert.equal(state.cursor, 3); assert.equal(saves, 3);
+    assert.deepEqual(state.rows.map(r => r.status), ['unavailable', 'unavailable', 'inactive']);
+    assert.deepEqual(state.rows.map(r => eligible(r, state)), [false, false, true]);
+  }
+});
+
+test('404 during removal revalidation skips the account without writing', async () => {
+  for (const stage of ['account', 'video']) {
+    const { row, state, io, events } = fixture();
+    if (stage === 'account') io.account = async () => ({ unavailable: true });
+    else io.video = async () => ({ status: 'unavailable', latest: null });
+    await removeOne(row, state, io);
+    assert.equal(row.status, 'unavailable'); assert.equal(row.review, 'keep');
+    assert.equal(events.includes('write'), false); assert.ok(events.includes('log:skipped-unavailable'));
+  }
+});

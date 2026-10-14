@@ -27,15 +27,17 @@ const { chromium } = require(process.env.CHUBILI_PLAYWRIGHT_MODULE || 'playwrigh
         const rel = (mid, attribute = 2, special = 0) => ({ mid, uname: `测试 UP ${mid}`, attribute, special });
         if (url.pathname === '/x/web-interface/nav') data = { isLogin: true, mid: 123,
           wbi_img: { img_url: `https://i.test/${'a'.repeat(32)}.png`, sub_url: `https://i.test/${'b'.repeat(32)}.png` } };
-        else if (url.pathname === '/x/relation/followings') data = { total: 7,
-          list: [rel(456), rel(457, 6), rel(458, 2, 1), rel(459), rel(460), rel(461), rel(462, 2, 1)] };
+        else if (url.pathname === '/x/relation/followings') data = { total: 9,
+          list: [rel(456), rel(457, 6), rel(458, 2, 1), rel(459), rel(460), rel(461), rel(462, 2, 1), rel(463), rel(464)] };
         else if (url.pathname === '/x/space/wbi/acc/info') {
           const mid = Number(url.searchParams.get('mid'));
+          if (mid === 464) { options.onload({ status: 200, responseText: '{"code":-404}' }); return; }
           data = { mid, silence: [461, 462].includes(mid) ? 1 : 0 };
         }
         else if (url.pathname === '/x/space/wbi/arc/search') {
           const mid = url.searchParams.get('mid');
           f.activeVideo++; f.maxActiveVideo = Math.max(f.maxActiveVideo, f.activeVideo);
+          if (mid === '463') { timeout(() => { f.activeVideo--; options.onload({ status: 404, responseText: '<html>missing</html>' }); }, 25); return; }
           if (f.fail && mid === '459') { timeout(() => { f.activeVideo--; options.onload({ status: 412, responseText: '<html>limited</html>' }); }, 25); return; }
           data = mid === '460' ? { page: { count: 0 }, list: { vlist: [] } } :
             { page: { count: 1 }, list: { vlist: [{ created: mid === '459' ? Math.floor(Date.now() / 1000) - 86400 : 1577836800 }] } };
@@ -74,17 +76,20 @@ const { chromium } = require(process.env.CHUBILI_PLAYWRIGHT_MODULE || 'playwrigh
     await page.evaluate(() => { window.fixture.fail = false; });
     await page.getByRole('button', { name: '继续扫描', exact: true }).click();
     await status.filter({ hasText: '扫描完成' }).waitFor();
-    assert.equal(await page.evaluate(() => window.fixture.requests.filter(p => p === '/x/space/wbi/arc/search').length), 2);
+    assert.equal(await page.evaluate(() => window.fixture.requests.filter(p => p === '/x/space/wbi/arc/search').length), 3);
     const progress = page.getByRole('progressbar', { name: '扫描进度' });
-    assert.equal(await progress.getAttribute('value'), '7');
+    assert.equal(await progress.getAttribute('value'), '9');
     await page.getByText('更多', { exact: true }).click();
     await page.getByRole('button', { name: '保存进度', exact: true }).click();
     await page.locator('button:has-text("保存进度"):enabled').waitFor();
     await load();
-    assert.equal(await progress.getAttribute('value'), '7');
+    assert.equal(await progress.getAttribute('value'), '9');
     assert.equal(await page.getByText(/最近保存/).count(), 1);
     assert.equal(await page.evaluate(() => window.fixture.requests.length), 0);
     await page.evaluate(() => { window.fixture.fail = false; });
+    await page.getByRole('combobox', { name: '筛选', exact: true }).selectOption('unavailable');
+    assert.equal(await page.getByRole('link').count(), 2);
+    assert.equal(await page.getByText('无法访问（404，已跳过）', { exact: true }).count(), 2);
     await page.getByRole('combobox', { name: '筛选', exact: true }).selectOption('remove');
     assert.equal(await page.getByRole('link', { name: '打开 测试 UP 461 投稿页', exact: true }).count(), 1);
     assert.equal(await page.getByRole('link', { name: '打开 测试 UP 462 投稿页', exact: true }).count(), 0);
@@ -126,9 +131,18 @@ const { chromium } = require(process.env.CHUBILI_PLAYWRIGHT_MODULE || 'playwrigh
     assert.ok(mobile.y >= 0 && mobile.y + mobile.height <= 844);
     await page.setViewportSize({ width: 1440, height: 1000 });
     await page.getByRole('combobox', { name: '筛选', exact: true }).selectOption('banned');
+    await page.getByRole('button', { name: '收起关注管理入口', exact: true }).click();
+    assert.equal(await panel.isVisible(), false);
+    assert.equal(await page.getByRole('button', { name: '关注管理 · ChuBiliQoL', exact: true }).isVisible(), false);
+    const collapsed = page.getByRole('button', { name: '展开关注管理入口', exact: true });
+    assert.equal(await collapsed.isVisible(), true);
+    const dot = await collapsed.boundingBox(); assert.equal(dot.width, 24); assert.equal(dot.height, 24);
+    await collapsed.click();
+    assert.equal(await page.getByRole('button', { name: '关注管理 · ChuBiliQoL', exact: true }).isVisible(), true);
+    await page.getByRole('button', { name: '关注管理 · ChuBiliQoL', exact: true }).click();
     assert.deepEqual(errors, []);
     fs.mkdirSync(path.join(__dirname, '..', 'artifacts'), { recursive: true });
     await page.screenshot({ path: path.join(__dirname, '..', 'artifacts', 'panel.png') });
-    console.log('PASS: compact/mobile panel, banned review/badges/protection, manual save and reload, 412 resume, review/removal, log export and parallel scan.');
+    console.log('PASS: HTTP/API 404 skip, checkpoint restore, collapsible entry, banned protections, 412 pause and parallel scan.');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

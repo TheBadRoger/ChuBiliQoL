@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChuBiliQoL
 // @namespace    https://github.com/TheBadRoger/ChuBiliQoL
-// @version      0.3.0
+// @version      0.3.1
 // @description  关注审核、停更和封禁筛选、断点续扫与安全取关
 // @author       TheBadRoger
 // @license      MIT
@@ -127,10 +127,12 @@
     const query = Object.keys(all).sort().map(k => `${encodeURIComponent(k)}=${encodeURIComponent(String(all[k]).replace(/[!'()*]/g, ''))}`).join('&');
     return `${query}&w_rid=${md5(query + key)}`;
   }
-  function parseResponse(response, allowEmpty = false) {
+  function parseResponse(response, allowEmpty = false, allowNotFound = false) {
+    if (allowNotFound && response.status === 404) return { unavailable: true };
     if (response.status !== 200) throw new Error(`HTTP ${response.status}：请求已暂停，不自动重试`);
     let body;
     try { body = JSON.parse(response.responseText); } catch { throw new Error('服务器返回非 JSON，已暂停'); }
+    if (allowNotFound && [-404, 404].includes(body.code)) return { unavailable: true };
     if (body.code !== 0) throw new Error(`API ${body.code}：请求已暂停，不自动重试`);
     if (allowEmpty && body.data == null) return null;
     if (!body.data || typeof body.data !== 'object') throw new Error('API 数据缺失');
@@ -152,12 +154,15 @@
     const age = now - row.banChecked;
     const account = typeof row.banned === 'boolean' && age >= 0 && age < DAY ?
       { banned: row.banned, banChecked: row.banChecked } : await io.account(row.mid);
+    if (account.unavailable) return { banned: false, banChecked: 0, status: 'unavailable', latest: null, checked: 0,
+      review: row.review === 'keep' ? 'keep' : 'pending' };
     if (account.banned) return { ...account, status: 'banned', latest: null, checked: 0,
       review: row.review === 'keep' || protectedRow(row, state) ? 'keep' : 'remove' };
     if (protectedRow(row, state)) return { ...account, status: 'protected' };
     const cached = cachedVideo(row, now);
-    return { ...account, ...(cached || { ...await io.video(row.mid), checked: Date.now() }),
-      review: row.status === 'banned' ? 'pending' : row.review };
+    const info = cached || { ...await io.video(row.mid), checked: Date.now() };
+    return { ...account, ...info,
+      review: info.status === 'unavailable' || row.status === 'banned' ? (row.review === 'keep' ? 'keep' : 'pending') : row.review };
   }
 
   function requestGate({ interval, wait, check, now = Date.now }) {
@@ -203,13 +208,20 @@
     io.checkStop();
     await io.identity();
     const wasBanned = row.status === 'banned';
-    Object.assign(row, await io.account(row.mid));
+    const account = await io.account(row.mid);
+    if (account.unavailable) {
+      Object.assign(row, { status: 'unavailable', banned: false, banChecked: 0, latest: null, review: 'keep' });
+      await io.save(); await io.log(row.mid, 'skipped-unavailable');
+      return;
+    }
+    Object.assign(row, account);
     Object.assign(row, row.banned ? { status: 'banned', latest: null } : await io.video(row.mid), { checked: Date.now() });
     Object.assign(row, relation(await io.relation(row.mid)));
     if (row.attribute === 6 && !state.excluded.includes(row.mid)) state.excluded.push(row.mid);
     if ((wasBanned && !row.banned) || !eligible(row, state)) {
       row.review = 'keep';
-      await io.save(); await io.log(row.mid, wasBanned && !row.banned ? 'skipped-unbanned' : 'skipped-protected-or-active');
+      await io.save(); await io.log(row.mid, row.status === 'unavailable' ? 'skipped-unavailable' :
+        wasBanned && !row.banned ? 'skipped-unbanned' : 'skipped-protected-or-active');
       return;
     }
     io.checkStop();
@@ -242,7 +254,7 @@
   const selected = new Set();
   let query = '', filter = 'candidates', sort = 'latest', page = 0, moreOpen = false;
   const labels = { inactive: '半年未投稿', active: '近期投稿', empty: '无可见视频（人工判断）',
-    protected: '受保护', banned: '已封禁', pending: '未扫描', removed: '已取关', uncertain: '操作结果待核实' };
+    protected: '受保护', banned: '已封禁', unavailable: '无法访问（404，已跳过）', pending: '未扫描', removed: '已取关', uncertain: '操作结果待核实' };
 
   function openDB() {
     return new Promise((resolve, reject) => {
@@ -297,7 +309,8 @@
           onabort: () => reject(new Error('请求中止，已暂停')) });
       });
       assertAccount();
-      return parseResponse(response, Boolean(body));
+      const allowNotFound = !body && ['/x/space/wbi/arc/search', '/x/space/wbi/acc/info'].includes(path);
+      return parseResponse(response, Boolean(body), allowNotFound);
     } catch (error) { requestError ||= error; throw error; }
   }
   async function identity() {
@@ -312,11 +325,13 @@
   }
   async function video(mid) {
     if (!key || Date.now() - keyTime > 30000) await identity();
-    return latestVideo(await api('/x/space/wbi/arc/search', sign({ mid, pn: 1, ps: 30, order: 'pubdate' }, key)));
+    const data = await api('/x/space/wbi/arc/search', sign({ mid, pn: 1, ps: 30, order: 'pubdate' }, key));
+    return data.unavailable ? { status: 'unavailable', latest: null } : latestVideo(data);
   }
   async function account(mid) {
     if (!key || Date.now() - keyTime > 30000) await identity();
-    return accountStatus(await api('/x/space/wbi/acc/info', sign({ mid }, key)), mid);
+    const data = await api('/x/space/wbi/acc/info', sign({ mid }, key));
+    return data.unavailable ? data : accountStatus(data, mid);
   }
   function rememberMutual(row) {
     if (row.attribute === 6 && !state.excluded.includes(row.mid)) state.excluded.push(row.mid);
@@ -488,7 +503,7 @@
       select.onchange = () => { callback(select.value); page = 0; render(); };
       return select;
     };
-    searchTools.append(search, makeSelect([['candidates', '停更 / 封禁'], ['inactive', '半年未投稿'], ['banned', '已封禁'], ['all', '全部关注'], ['protected', '受保护'], ['empty', '无可见视频'], ['pending', '未扫描'], ['keep', '已保留'], ['remove', '待取关'], ['uncertain', '待核实'], ['removed', '已取关']], filter, v => { filter = v; }, '筛选'),
+    searchTools.append(search, makeSelect([['candidates', '停更 / 封禁'], ['inactive', '半年未投稿'], ['banned', '已封禁'], ['all', '全部关注'], ['protected', '受保护'], ['empty', '无可见视频'], ['unavailable', '404 已跳过'], ['pending', '未扫描'], ['keep', '已保留'], ['remove', '待取关'], ['uncertain', '待核实'], ['removed', '已取关']], filter, v => { filter = v; }, '筛选'),
       makeSelect([['latest', '投稿时间：旧 → 新'], ['name', '昵称'], ['uid', 'UID']], sort, v => { sort = v; }, '排序'));
     panel.append(searchTools);
     const visible = visibleRows();
@@ -566,10 +581,25 @@
     render();
   }
   const entry = el('button', '关注管理 · ChuBiliQoL', { type: 'button' });
-  entry.style.cssText = 'position:fixed;right:20px;bottom:25px;z-index:2147483646;background:#173450;color:#fff;border:1px solid #80d4ff;border-radius:22px;padding:10px 16px;cursor:pointer;font:14px system-ui';
+  const entryWrap = el('div');
+  entryWrap.style.cssText = 'position:fixed;right:20px;bottom:25px;z-index:2147483646;display:flex;align-items:center;gap:4px';
+  const entryStyle = 'background:#173450;color:#fff;border:1px solid #80d4ff;border-radius:22px;padding:10px 16px;cursor:pointer;font:14px system-ui';
+  entry.style.cssText = entryStyle;
+  const collapseEntry = el('button', '−', { type: 'button', ariaLabel: '收起关注管理入口', title: '收起入口和面板' });
+  const restoreEntry = el('button', '·', { type: 'button', ariaLabel: '展开关注管理入口', title: '恢复 ChuBiliQoL 入口' });
+  collapseEntry.style.cssText = `${entryStyle};padding:8px;width:30px;height:30px`;
+  restoreEntry.style.cssText = `${entryStyle};display:none;padding:0;width:24px;height:24px;opacity:.6`;
+  collapseEntry.onclick = () => {
+    entry.style.display = 'none'; collapseEntry.style.display = 'none'; restoreEntry.style.display = 'block';
+    if (root) root.host.hidden = true;
+  };
+  restoreEntry.onclick = () => {
+    entry.style.display = ''; collapseEntry.style.display = ''; restoreEntry.style.display = 'none';
+  };
   entry.onclick = () => {
     if (root) { root.host.hidden = !root.host.hidden; return; }
     boot().catch(e => alert(e.message));
   };
-  document.body.append(entry);
+  entryWrap.append(entry, collapseEntry, restoreEntry);
+  document.body.append(entryWrap);
 })();
