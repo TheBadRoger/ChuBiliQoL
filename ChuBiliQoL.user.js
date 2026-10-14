@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChuBiliQoL
 // @namespace    https://github.com/TheBadRoger/ChuBiliQoL
-// @version      0.1.0
+// @version      0.2.0
 // @description  关注审核、半年未投稿筛选、断点续扫与安全取关
 // @author       TheBadRoger
 // @license      MIT
@@ -129,8 +129,47 @@
     return body.data;
   }
   function freshState(account) {
-    return { version: 1, account, rows: [], excluded: [], protectSpecial: true,
+    return { version: 1, account, rows: [], excluded: [], protectSpecial: true, scanConcurrency: 1,
       page: 1, total: null, listed: false, complete: false, cursor: 0, message: '尚未扫描' };
+  }
+
+  function requestGate({ interval, wait, check, now = Date.now }) {
+    let tail = Promise.resolve(), last = -Infinity;
+    return () => {
+      const slot = tail.then(async () => {
+        check();
+        await wait(Math.max(0, last + interval() - now()));
+        check();
+        last = now();
+      });
+      tail = slot.catch(() => {});
+      return slot;
+    };
+  }
+  async function scanRows(state, concurrency, io) {
+    let next = state.cursor, failure, commits = Promise.resolve();
+    const finished = new Set();
+    async function worker() {
+      while (!failure) {
+        try {
+          io.checkStop();
+          const index = next++;
+          if (index >= state.rows.length) return;
+          const patch = await io.inspect(state.rows[index]);
+          commits = commits.then(async () => {
+            Object.assign(state.rows[index], patch);
+            finished.add(index);
+            // Only advance past contiguous results: an earlier failed row must remain resumable.
+            while (finished.delete(state.cursor)) state.cursor++;
+            await io.save();
+            io.progress();
+          });
+          await commits;
+        } catch (error) { failure ||= error; io.stop(error); }
+      }
+    }
+    await Promise.all(Array.from({ length: concurrency === 2 ? 2 : 1 }, worker));
+    if (failure) throw failure;
   }
 
   async function removeOne(row, state, io) {
@@ -163,16 +202,16 @@
 
   // The exact same functions are exercised by Node's dependency-free test runner.
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { uid, cutoff, relation, latestVideo, eligible, cachedVideo, mergeReview, md5, wbiKey, sign, parseResponse, freshState, removeOne };
+    module.exports = { uid, cutoff, relation, latestVideo, eligible, cachedVideo, mergeReview, md5, wbiKey, sign, parseResponse, freshState, removeOne, requestGate, scanRows };
     return;
   }
   if (window.top !== window.self) return;
 
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const cookie = name => document.cookie.split('; ').find(s => s.startsWith(`${name}=`))?.slice(name.length + 1);
-  let db, state, root, busy = false, stopping = false, nextRequest = 0, key = '', keyTime = 0;
+  let db, state, root, busy = false, stopping = false, scanning = false, requestError, identityTask, key = '', keyTime = 0;
   const selected = new Set();
-  let query = '', filter = 'inactive', sort = 'latest', page = 0;
+  let query = '', filter = 'inactive', sort = 'latest', page = 0, moreOpen = false;
   const labels = { inactive: '半年未投稿', active: '近期投稿', empty: '无可见视频（人工判断）',
     protected: '受保护', pending: '未扫描', removed: '已取关', uncertain: '操作结果待核实' };
 
@@ -205,31 +244,38 @@
   }
   function checkStop() {
     assertAccount();
+    if (requestError) throw requestError;
     if (stopping) throw new Error('已手动暂停，可继续扫描；取关需要重新确认');
   }
+  const waitRequest = requestGate({ interval: () => scanning && state.scanConcurrency === 2 ? 1500 : 2500,
+    wait: sleep, check: checkStop });
   async function api(path, params = {}, body) {
-    checkStop();
-    await sleep(Math.max(0, nextRequest - Date.now()));
-    checkStop();
-    nextRequest = Date.now() + 2500;
-    const qs = typeof params === 'string' ? params : new URLSearchParams(params).toString();
-    const response = await new Promise((resolve, reject) => {
-      GM.xmlHttpRequest({ method: body ? 'POST' : 'GET',
-        url: `https://api.bilibili.com${path}${qs ? `?${qs}` : ''}`, timeout: 20000,
-        headers: body ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {},
-        data: body?.toString(), anonymous: false,
-        onload: resolve, onerror: () => reject(new Error('网络错误，已暂停，不重试')),
-        ontimeout: () => reject(new Error('请求超时，已暂停；取关结果可能不确定')),
-        onabort: () => reject(new Error('请求中止，已暂停')) });
-    });
-    assertAccount();
-    return parseResponse(response, Boolean(body));
+    try {
+      await waitRequest();
+      checkStop();
+      const qs = typeof params === 'string' ? params : new URLSearchParams(params).toString();
+      const response = await new Promise((resolve, reject) => {
+        GM.xmlHttpRequest({ method: body ? 'POST' : 'GET',
+          url: `https://api.bilibili.com${path}${qs ? `?${qs}` : ''}`, timeout: 20000,
+          headers: body ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {},
+          data: body?.toString(), anonymous: false,
+          onload: resolve, onerror: () => reject(new Error('网络错误，已暂停，不重试')),
+          ontimeout: () => reject(new Error('请求超时，已暂停；取关结果可能不确定')),
+          onabort: () => reject(new Error('请求中止，已暂停')) });
+      });
+      assertAccount();
+      return parseResponse(response, Boolean(body));
+    } catch (error) { requestError ||= error; throw error; }
   }
   async function identity() {
-    const nav = await api('/x/web-interface/nav');
-    if (!nav.isLogin || uid(nav.mid) !== state.account) throw new Error('账号验证失败，请重新登录并刷新');
-    key = wbiKey(nav.wbi_img);
-    keyTime = Date.now();
+    if (identityTask) return identityTask;
+    identityTask = (async () => {
+      const nav = await api('/x/web-interface/nav');
+      if (!nav.isLogin || uid(nav.mid) !== state.account) throw new Error('账号验证失败，请重新登录并刷新');
+      key = wbiKey(nav.wbi_img);
+      keyTime = Date.now();
+    })().finally(() => { identityTask = null; });
+    return identityTask;
   }
   async function video(mid) {
     if (!key || Date.now() - keyTime > 30000) await identity();
@@ -275,19 +321,18 @@
       state.message = `已获取 ${state.rows.length} / ${state.total} 个关注`;
       await save(); render();
     }
-    while (state.cursor < state.rows.length) {
-      checkStop();
-      const row = state.rows[state.cursor];
-      if (state.excluded.includes(row.mid) || (state.protectSpecial && row.special === 1)) row.status = 'protected';
-      else {
-        const cached = cachedVideo(row);
-        Object.assign(row, cached || await video(row.mid));
-        if (!cached) row.checked = Date.now();
-      }
-      state.cursor++;
-      state.message = `已扫描 ${state.cursor} / ${state.rows.length}`;
-      await save(); render();
-    }
+    scanning = true;
+    try {
+      await scanRows(state, state.scanConcurrency, { checkStop,
+        inspect: async row => {
+          if (state.excluded.includes(row.mid) || (state.protectSpecial && row.special === 1)) return { status: 'protected' };
+          const cached = cachedVideo(row);
+          return cached || { ...await video(row.mid), checked: Date.now() };
+        },
+        save: async () => { state.message = `已扫描 ${state.cursor} / ${state.rows.length}`; await save(); },
+        progress: render, stop: error => { requestError ||= error; }
+      });
+    } finally { scanning = false; }
     state.complete = true;
     delete state.previous;
     state.message = '扫描完成，请人工审核；缓存有效期 24 小时';
@@ -318,7 +363,7 @@
     try {
       await navigator.locks.request('ChuBiliQoL-operation', { ifAvailable: true }, async lock => {
         if (!lock) throw new Error('其他页面正在操作，请等待或关闭该页面');
-        busy = true; stopping = false;
+        busy = true; stopping = false; requestError = null;
         try {
           assertAccount();
           state = await store('state', 'readonly', s => s.get(state.account)) || state;
@@ -364,15 +409,22 @@
     const focus = root.activeElement?.id;
     const position = root.activeElement?.selectionStart;
     root.replaceChildren();
-    const style = el('style', `:host([hidden]){display:none}:host{all:initial;font:14px/1.5 system-ui;color:#e7edf6}*{box-sizing:border-box}section{position:fixed;inset:6vh 3vw;background:#141c2b;border:1px solid #53647e;border-radius:16px;box-shadow:0 20px 80px #0009;display:flex;flex-direction:column;padding:20px;z-index:2147483647}h2{margin:0;font-size:22px}header,.tools,footer{display:flex;gap:8px;flex-wrap:wrap;align-items:center}header{justify-content:space-between}.tools{margin:10px 0}button,input,select{font:inherit;color:inherit;background:#24334b;border:1px solid #61718b;border-radius:7px;padding:7px}button{cursor:pointer}button:disabled{opacity:.4;cursor:default}input[type=checkbox]{accent-color:#62c8ff}a{color:#80d4ff}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:9px;border-bottom:1px solid #33435b}th{position:sticky;top:0;background:#1e2b40}td:nth-child(2){max-width:250px;overflow-wrap:anywhere}small{color:#a8b9d0}.scroll{overflow:auto;flex:1;min-height:100px}.notice{padding:10px;background:#223148;border-radius:8px;margin:8px 0}footer{margin-top:10px}label{display:flex;align-items:center;gap:5px}.danger{background:#793742}button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid #80d4ff}@media(max-width:650px){section{inset:1vh 1vw;padding:10px}td,th{padding:5px;font-size:12px}}`);
+    const style = el('style', `:host([hidden]){display:none}:host{all:initial;font:13px/1.5 system-ui;color:#e7edf6}*{box-sizing:border-box}section{position:fixed;right:24px;bottom:76px;width:min(860px,calc(100vw - 32px));height:min(620px,calc(100vh - 100px));background:#141c2b;border:1px solid #53647e;border-radius:12px;box-shadow:0 12px 48px #0007;display:flex;flex-direction:column;padding:16px;z-index:2147483647}h2{margin:0;font-size:18px}header,.tools,footer{display:flex;gap:6px;flex-wrap:wrap;align-items:center}header{justify-content:space-between}.tools{margin:7px 0}button,input,select{font:inherit;color:inherit;background:#24334b;border:1px solid #61718b;border-radius:6px;padding:5px 8px}button,summary{cursor:pointer}button:disabled{opacity:.4;cursor:default}input[type=checkbox]{accent-color:#62c8ff}input[type=search]{flex:1;min-width:130px}a{color:#80d4ff;text-decoration:none}a:hover{text-decoration:underline}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:7px;border-bottom:1px solid #33435b}th{position:sticky;top:0;background:#1e2b40}td:nth-child(2){max-width:220px;overflow-wrap:anywhere}td small{display:block}small{color:#a8b9d0}.scroll{overflow:auto;flex:1;min-height:80px}.notice{padding:7px 9px;background:#223148;border-radius:6px;margin:7px 0;max-height:64px;overflow:auto}footer{margin-top:8px}footer span{margin-right:auto}label{display:flex;align-items:center;gap:4px}.danger{background:#793742}details{border-top:1px solid #33435b;margin-top:8px;padding-top:6px;max-height:150px;overflow:auto}summary{color:#a8b9d0;width:max-content}button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible,summary:focus-visible{outline:2px solid #80d4ff}@media(max-width:650px){section{right:8px;bottom:64px;width:calc(100vw - 16px);height:calc(100dvh - 80px);padding:10px}td,th{padding:5px;font-size:12px}h2{font-size:16px}}`);
     root.append(style);
     const panel = el('section', undefined, { role: 'dialog', ariaLabel: 'ChuBiliQoL 关注管理' });
     const header = el('header');
-    header.append(el('h2', 'ChuBiliQoL · 关注审核'), button('收起', () => { root.host.hidden = true; }, false));
-    panel.append(header, el('small', `当前账号 UID ${state.account} · 曾识别为互粉 ${state.excluded.length} 个（永久保护）`));
+    const headerActions = el('div', undefined, { className: 'tools' });
+    headerActions.append(button(busy ? '暂停' : '继续扫描', () => {
+      if (busy) { stopping = true; state.message = '正在暂停，等待已发出的请求结束'; render(); }
+      else exclusive(() => scan());
+    }, busy && stopping), button('收起', () => { root.host.hidden = true; }, false));
+    header.append(el('h2', 'ChuBiliQoL · 关注审核'), headerActions);
+    panel.append(header, el('small', `UID ${state.account} · 互粉保护 ${state.excluded.length} 个 · ${state.scanConcurrency === 2 ? '双路扫描' : '串行扫描'}`));
+    const more = el('details', undefined, { open: moreOpen });
+    more.append(el('summary', '更多'));
+    more.ontoggle = () => { moreOpen = more.open; };
     const tools = el('div', undefined, { className: 'tools' });
-    tools.append(button('继续扫描', () => exclusive(() => scan())), button('重新扫描', () => exclusive(() => scan(true))),
-      button('暂停', () => { stopping = true; state.message = '正在暂停，等待当前请求结束'; render(); }, !busy));
+    tools.append(button('重新扫描', () => exclusive(() => scan(true))));
     const protect = el('input', undefined, { type: 'checkbox', checked: state.protectSpecial, disabled: busy });
     protect.onchange = () => exclusive(async () => {
       if (!protect.checked && !confirm('关闭特别关注保护？互粉保护仍永久生效。修改后需要重新扫描。')) return;
@@ -382,7 +434,12 @@
       await save();
     });
     const label = el('label'); label.append(protect, el('span', '保护特别关注')); tools.append(label);
-    panel.append(tools, el('div', state.message, { className: 'notice', role: 'status', ariaLive: 'polite' }));
+    const parallel = el('input', undefined, { type: 'checkbox', checked: state.scanConcurrency === 2, disabled: busy });
+    parallel.onchange = () => exclusive(async () => { state.scanConcurrency = parallel.checked ? 2 : 1; await save(); });
+    const parallelLabel = el('label', undefined, { title: '最多两路查询，至少间隔 1.5 秒发送；遇到限制即暂停。取关始终串行。' });
+    parallelLabel.append(parallel, el('span', '双路并行扫描')); tools.append(parallelLabel);
+    more.append(tools);
+    panel.append(el('div', state.message, { className: 'notice', role: 'status', ariaLive: 'polite' }));
     const searchTools = el('div', undefined, { className: 'tools' });
     const search = el('input', undefined, { id: 'search', type: 'search', placeholder: '搜索昵称 / UID', value: query, ariaLabel: '搜索昵称或 UID' });
     search.oninput = () => { query = search.value; page = 0; render(); };
@@ -407,14 +464,13 @@
       await save();
     });
     batch.append(button('选择本页', () => { current.forEach(r => selected.add(r.mid)); render(); }),
-      button('清空选择', () => { selected.clear(); render(); }),
-      button('批量保留', () => setReview('keep')), button('标记待取关', () => setReview('remove')),
-      button('恢复待审核', () => setReview('pending')));
+      button('批量保留', () => setReview('keep')), button('标记待取关', () => setReview('remove')));
+    tools.append(button('清空选择', () => { selected.clear(); render(); }), button('恢复待审核', () => setReview('pending')));
     const remove = button('取关选中审核项', () => exclusive(removeReviewed), busy || !state.complete);
     remove.className = 'danger'; batch.append(remove); panel.append(batch);
     const scroll = el('div', undefined, { className: 'scroll' });
     const table = el('table'); const head = el('tr');
-    ['选择', 'UP 主', '最近视频', '扫描状态', '审核', '投稿页'].forEach(t => head.append(el('th', t)));
+    ['选择', 'UP 主 ↗ 投稿', '最近视频', '状态', '审核'].forEach(t => head.append(el('th', t)));
     const thead = el('thead'); thead.append(head); table.append(thead);
     const body = el('tbody');
     for (const row of current) {
@@ -422,17 +478,19 @@
       const cb = el('input', undefined, { type: 'checkbox', checked: selected.has(row.mid), disabled: busy, ariaLabel: `选择 ${row.name}` });
       cb.onchange = () => { if (cb.checked) selected.add(row.mid); else selected.delete(row.mid); render(); };
       selectCell.append(cb);
-      tr.append(selectCell, el('td', `${row.name} (${row.mid})`), el('td', row.latest ? new Date(row.latest).toLocaleDateString() : '—'),
+      const name = el('td');
+      name.append(el('a', row.name, { href: `https://space.bilibili.com/${row.mid}/upload/video`, target: '_blank', rel: 'noopener noreferrer', ariaLabel: `打开 ${row.name} 投稿页` }), el('small', row.mid));
+      tr.append(selectCell, name, el('td', row.latest ? new Date(row.latest).toLocaleDateString() : '—'),
         el('td', state.excluded.includes(row.mid) ? '互粉永久排除' : labels[row.status] || row.status),
         el('td', { pending: '待审核', keep: '保留', remove: '待取关' }[row.review]));
-      const link = el('td'); link.append(el('a', '打开投稿', { href: `https://space.bilibili.com/${row.mid}/upload/video`, target: '_blank', rel: 'noopener noreferrer' }));
-      tr.append(link); body.append(tr);
+      body.append(tr);
     }
     table.append(body); scroll.append(table); panel.append(scroll);
     const footer = el('footer');
     footer.append(el('span', `匹配 ${visible.length} / 总计 ${state.rows.length} · 已选 ${selected.size} · 第 ${page + 1} 页`),
-      button('上一页', () => { page--; render(); }, page <= 0), button('下一页', () => { page++; render(); }, (page + 1) * 50 >= visible.length),
-      button('导出审核名单', () => exclusive(async () => download(reviewExport(), `ChuBiliQoL-review-${state.account}.json`))),
+      button('上一页', () => { page--; render(); }, page <= 0), button('下一页', () => { page++; render(); }, (page + 1) * 50 >= visible.length));
+    const files = el('div', undefined, { className: 'tools' });
+    files.append(button('导出审核名单', () => exclusive(async () => download(reviewExport(), `ChuBiliQoL-review-${state.account}.json`))),
       button('导入审核名单', () => { file.click(); }),
       button('导出操作记录', () => exclusive(async () => {
         const logs = await store('logs', 'readonly', s => s.getAll());
@@ -445,7 +503,7 @@
       mergeReview(state, JSON.parse(await file.files[0].text()));
       await save(); state.message = '已合并保留和排除名单；导入的待取关项需要重新人工审核'; await save();
     });
-    footer.append(file); panel.append(footer); root.append(panel);
+    files.append(file); more.append(files); panel.append(footer, more); root.append(panel);
     if (focus === 'search') {
       const searchBox = root.getElementById('search'); searchBox.focus();
       if (position !== null) searchBox.setSelectionRange(position, position);

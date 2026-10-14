@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
-const { cutoff, uid, relation, latestVideo, eligible, cachedVideo, mergeReview, md5, wbiKey, sign, parseResponse, freshState, removeOne } = require('../ChuBiliQoL.user.js');
+const { cutoff, uid, relation, latestVideo, eligible, cachedVideo, mergeReview, md5, wbiKey, sign, parseResponse, freshState, removeOne, requestGate, scanRows } = require('../ChuBiliQoL.user.js');
 
 const oldDate = Date.UTC(2020, 0, 1);
 function fixture() {
@@ -142,4 +142,81 @@ test('storage failure, identity change and pause each prevent destructive reques
     await assert.rejects(removeOne(row, state, io));
     assert.equal(events.includes('write'), false);
   }
+});
+
+const flush = () => new Promise(setImmediate);
+test('parallel scanning is bounded and never checkpoints over an unfinished earlier row', async () => {
+  const state = freshState('123'); state.rows = [0, 1, 2, 3].map(mid => ({ mid }));
+  const pending = state.rows.map(() => Promise.withResolvers());
+  const calls = [], cursors = [];
+  const task = scanRows(state, 2, {
+    checkStop() {}, stop() {}, progress() {},
+    inspect: row => { calls.push(row.mid); return pending[row.mid].promise; },
+    save: async () => cursors.push(state.cursor)
+  });
+  assert.deepEqual(calls, [0, 1]);
+  pending[1].resolve({ status: 'active' }); await flush();
+  assert.deepEqual(calls, [0, 1, 2]); assert.equal(state.cursor, 0);
+  pending[0].resolve({ status: 'active' }); await flush();
+  assert.equal(state.cursor, 2); assert.deepEqual(calls, [0, 1, 2, 3]);
+  pending[3].resolve({ status: 'empty' }); await flush();
+  assert.equal(state.cursor, 2);
+  pending[2].resolve({ status: 'inactive' }); await task;
+  assert.equal(state.cursor, 4); assert.deepEqual(cursors, [0, 2, 2, 4]);
+});
+
+test('parallel failure drains active work, preserves later cached results, and resumes the failed gap', async () => {
+  const state = freshState('123'); state.rows = [0, 1, 2, 3].map(mid => ({ mid }));
+  const pending = state.rows.map(() => Promise.withResolvers());
+  let failure; const calls = [];
+  const io = { checkStop() { if (failure) throw failure; }, stop(e) { failure ||= e; },
+    save: async () => {}, progress() {}, inspect(row) { calls.push(row.mid); return pending[row.mid].promise; } };
+  let settled = false;
+  const task = scanRows(state, 2, io);
+  const rejected = assert.rejects(task, /412/).then(() => { settled = true; });
+  pending[1].resolve({ latest: oldDate, checked: Date.now(), status: 'inactive' }); await flush();
+  pending[0].reject(new Error('HTTP 412')); await flush();
+  assert.equal(settled, false); assert.deepEqual(calls, [0, 1, 2]);
+  pending[2].resolve({ latest: oldDate, checked: Date.now(), status: 'inactive' }); await rejected;
+  assert.equal(state.cursor, 0); assert.equal(state.rows[2].status, 'inactive');
+  failure = undefined; const fetched = [];
+  io.inspect = async row => cachedVideo(row) || (fetched.push(row.mid), { latest: oldDate, checked: Date.now(), status: 'inactive' });
+  await scanRows(state, 2, io);
+  assert.deepEqual(fetched.sort(), [0, 3]); assert.equal(state.cursor, 4);
+});
+
+test('parallel scan stops on pause or storage failure and does not dispatch more work', async () => {
+  for (const kind of ['pause', 'storage']) {
+    const state = freshState('123'); state.rows = [0, 1, 2, 3].map(mid => ({ mid }));
+    const pending = [Promise.withResolvers(), Promise.withResolvers()];
+    let failure; const calls = [];
+    const task = scanRows(state, 2, {
+      checkStop() { if (failure) throw failure; }, stop(e) { failure ||= e; }, progress() {},
+      inspect: row => { calls.push(row.mid); return pending[row.mid].promise; },
+      save: async () => { if (kind === 'storage') throw new Error('storage'); }
+    });
+    const rejected = assert.rejects(task, new RegExp(kind));
+    if (kind === 'pause') failure = new Error('pause');
+    pending[0].resolve({ status: 'active' }); await flush();
+    pending[1].resolve({ status: 'active' }); await rejected;
+    assert.deepEqual(calls, [0, 1]);
+  }
+});
+
+test('one shared request gate spaces concurrent starts and cancels queued work after 412', async () => {
+  let clock = 0, failure;
+  const starts = [];
+  const check = () => { if (failure) throw failure; };
+  const gate = requestGate({ now: () => clock, interval: () => 1500, check,
+    wait: async ms => { clock += ms; } });
+  await Promise.all(Array.from({ length: 4 }, async () => { await gate(); starts.push(clock); }));
+  assert.deepEqual(starts, [0, 1500, 3000, 4500]);
+  const held = Promise.withResolvers();
+  const limited = requestGate({ now: () => 0, interval: () => 1500, check,
+    wait: ms => ms ? held.promise : Promise.resolve() });
+  await limited();
+  const queued = [limited(), limited()];
+  const results = Promise.allSettled(queued);
+  await flush(); failure = new Error('HTTP 412'); held.resolve();
+  assert.deepEqual((await results).map(r => r.status), ['rejected', 'rejected']);
 });

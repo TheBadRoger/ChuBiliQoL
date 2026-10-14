@@ -19,7 +19,7 @@ const { chromium } = require(process.env.CHUBILI_PLAYWRIGHT_MODULE || 'playwrigh
       Element.prototype.attachShadow = function (init) { return attach.call(this, { ...init, mode: 'open' }); };
       const timeout = window.setTimeout;
       window.setTimeout = (fn, ms, ...args) => timeout(fn, Math.min(ms, 5), ...args);
-      window.fixture = { fail: true, writes: [], requests: [] };
+      window.fixture = { fail: true, writes: [], requests: [], activeVideo: 0, maxActiveVideo: 0 };
       window.GM = { xmlHttpRequest(options) {
         const url = new URL(options.url);
         const f = window.fixture; f.requests.push(url.pathname);
@@ -31,14 +31,17 @@ const { chromium } = require(process.env.CHUBILI_PLAYWRIGHT_MODULE || 'playwrigh
           list: [rel(456), rel(457, 6), rel(458, 2, 1), rel(459), rel(460)] };
         else if (url.pathname === '/x/space/wbi/arc/search') {
           const mid = url.searchParams.get('mid');
-          if (f.fail && mid === '459') { options.onload({ status: 412, responseText: '<html>limited</html>' }); return; }
+          f.activeVideo++; f.maxActiveVideo = Math.max(f.maxActiveVideo, f.activeVideo);
+          if (f.fail && mid === '459') { timeout(() => { f.activeVideo--; options.onload({ status: 412, responseText: '<html>limited</html>' }); }, 25); return; }
           data = mid === '460' ? { page: { count: 0 }, list: { vlist: [] } } :
             { page: { count: 1 }, list: { vlist: [{ created: mid === '459' ? Math.floor(Date.now() / 1000) - 86400 : 1577836800 }] } };
         } else if (url.pathname === '/x/relation') data = rel(Number(url.searchParams.get('fid')));
         else if (url.pathname === '/x/relation/modify') {
           f.writes.push(new URLSearchParams(options.data).get('fid')); data = null;
         } else throw new Error(`Unexpected API: ${url.pathname}`);
-        options.onload({ status: 200, responseText: JSON.stringify({ code: 0, data }) });
+        const response = { status: 200, responseText: JSON.stringify({ code: 0, data }) };
+        if (url.pathname === '/x/space/wbi/arc/search') timeout(() => { f.activeVideo--; options.onload(response); }, 25);
+        else options.onload(response);
       } };
     });
     const page = await context.newPage(); const errors = [];
@@ -54,6 +57,10 @@ const { chromium } = require(process.env.CHUBILI_PLAYWRIGHT_MODULE || 'playwrigh
     };
     const status = page.getByRole('status');
     await load();
+    const panel = page.getByRole('dialog', { name: 'ChuBiliQoL 关注管理' });
+    const bounds = await panel.boundingBox();
+    assert.equal(bounds.width, 860); assert.equal(bounds.height, 620);
+    assert.equal(await page.getByRole('button', { name: '重新扫描', exact: true }).isVisible(), false);
     await page.getByRole('button', { name: '继续扫描', exact: true }).click();
     await status.filter({ hasText: 'HTTP 412' }).waitFor();
     assert.equal(await page.evaluate(() => window.fixture.requests.filter(p => p === '/x/space/wbi/arc/search').length), 2);
@@ -67,7 +74,7 @@ const { chromium } = require(process.env.CHUBILI_PLAYWRIGHT_MODULE || 'playwrigh
     await page.getByRole('combobox', { name: '筛选', exact: true }).selectOption('all');
     assert.equal(await page.getByText('互粉永久排除', { exact: true }).count(), 1);
     await page.getByRole('searchbox', { name: '搜索昵称或 UID' }).fill('456');
-    assert.equal(await page.getByRole('link', { name: '打开投稿', exact: true }).count(), 1);
+    assert.equal(await page.getByRole('link', { name: '打开 测试 UP 456 投稿页', exact: true }).count(), 1);
     await page.getByRole('checkbox', { name: '选择 测试 UP 456', exact: true }).check();
     await page.getByRole('button', { name: '标记待取关', exact: true }).click();
     await page.getByRole('button', { name: '取关选中审核项', exact: true }).click();
@@ -78,15 +85,29 @@ const { chromium } = require(process.env.CHUBILI_PLAYWRIGHT_MODULE || 'playwrigh
     assert.equal(await page.getByRole('heading', { name: 'ChuBiliQoL · 关注审核' }).isVisible(), false);
     await page.getByRole('button', { name: '关注管理 · ChuBiliQoL', exact: true }).click();
     assert.equal(await page.getByRole('heading', { name: 'ChuBiliQoL · 关注审核' }).isVisible(), true);
+    await page.getByText('更多', { exact: true }).click();
     const download = page.waitForEvent('download');
     await page.getByRole('button', { name: '导出操作记录', exact: true }).click();
     const file = await download;
     const logs = JSON.parse(fs.readFileSync(await file.path(), 'utf8'));
     assert.deepEqual(logs.map(l => l.result), ['intent', 'success']);
     assert.equal(JSON.stringify(logs).includes('csrf'), false);
+    await page.getByRole('checkbox', { name: '双路并行扫描', exact: true }).check();
+    // Expire the cache so the parallel UI path must issue overlapping video queries.
+    await page.evaluate(() => { const now = Date.now; Date.now = () => now() + 86400001; });
+    await page.getByRole('button', { name: '重新扫描', exact: true }).click();
+    await status.filter({ hasText: '扫描完成' }).waitFor();
+    assert.equal(await page.getByRole('checkbox', { name: '双路并行扫描', exact: true }).isChecked(), true);
+    assert.equal(await page.evaluate(() => window.fixture.maxActiveVideo), 2);
+    await page.getByText('更多', { exact: true }).click();
+    await page.setViewportSize({ width: 390, height: 844 });
+    const mobile = await panel.boundingBox();
+    assert.ok(mobile.x >= 0 && mobile.x + mobile.width <= 390);
+    assert.ok(mobile.y >= 0 && mobile.y + mobile.height <= 844);
+    await page.setViewportSize({ width: 1440, height: 1000 });
     assert.deepEqual(errors, []);
     fs.mkdirSync(path.join(__dirname, '..', 'artifacts'), { recursive: true });
     await page.screenshot({ path: path.join(__dirname, '..', 'artifacts', 'panel.png') });
-    console.log('PASS: offline browser scan, 412 pause, IndexedDB reload/resume, protections, search, review, confirmed removal, log export and collapse.');
+    console.log('PASS: compact/mobile panel, collapsed tools, scan, 412 pause, IndexedDB resume, protections, review/removal, log export and parallel option.');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });
