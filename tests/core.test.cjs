@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
-const { cutoff, uid, relation, latestVideo, eligible, cachedVideo, mergeReview, md5, wbiKey, sign, parseResponse, freshState, removeOne, requestGate, scanRows } = require('../ChuBiliQoL.user.js');
+const { cutoff, uid, relation, latestVideo, accountStatus, eligible, cachedVideo, mergeReview, md5, wbiKey, sign, parseResponse, freshState, upgradeScan, inspectRow, removeOne, requestGate, scanRows } = require('../ChuBiliQoL.user.js');
 
 const oldDate = Date.UTC(2020, 0, 1);
 function fixture() {
@@ -12,6 +12,7 @@ function fixture() {
   const events = [];
   const io = {
     checkStop() {}, identity: async () => events.push('identity'),
+    account: async () => ({ banned: false, banChecked: Date.now() }),
     video: async () => ({ latest: oldDate, status: 'inactive' }),
     relation: async () => ({ attribute: 2, special: 0 }),
     operation: () => 'operation-1',
@@ -219,4 +220,68 @@ test('one shared request gate spaces concurrent starts and cancels queued work a
   const results = Promise.allSettled(queued);
   await flush(); failure = new Error('HTTP 412'); held.resolve();
   assert.deepEqual((await results).map(r => r.status), ['rejected', 'rejected']);
+});
+
+test('only a matching UID and explicit silence flag identify banned accounts', () => {
+  assert.deepEqual(accountStatus({ mid: 456, silence: 1 }, '456', 1000), { banned: true, banChecked: 1000 });
+  assert.equal(accountStatus({ mid: 456, silence: 0, sys_notice: { content: '封禁' } }, '456').banned, false);
+  for (const data of [{ mid: 456 }, { mid: 789, silence: 1 }, { mid: 456, silence: '1' }, { mid: 456, silence: 2 }]) {
+    assert.throws(() => accountStatus(data, '456'));
+  }
+});
+
+test('banned accounts enter removal review without video queries while keep and protections survive', async () => {
+  for (const protection of ['none', 'keep', 'mutual', 'special', 'excluded']) {
+    const { row, state } = fixture(); row.status = 'active'; row.latest = Date.now(); row.review = 'pending';
+    if (protection === 'keep') row.review = 'keep';
+    if (protection === 'mutual') row.attribute = 6;
+    if (protection === 'special') row.special = 1;
+    if (protection === 'excluded') state.excluded.push(row.mid);
+    let videos = 0;
+    Object.assign(row, await inspectRow(row, state, {
+      account: async () => accountStatus({ mid: 456, silence: 1 }, row.mid),
+      video: async () => { videos++; throw new Error('must not query banned videos'); }
+    }));
+    assert.equal(row.status, 'banned'); assert.equal(row.latest, null); assert.equal(videos, 0);
+    assert.equal(row.review, protection === 'none' ? 'remove' : 'keep');
+    assert.equal(eligible(row, state), protection === 'none');
+  }
+});
+
+test('ban cache expires without sliding lifetime and unbanned scans reset automatic removal review', async () => {
+  const { row, state } = fixture();
+  const now = Date.now(); Object.assign(row, { banned: true, banChecked: now - 100, status: 'banned', latest: null });
+  let calls = 0;
+  const io = { account: async () => { calls++; return accountStatus({ mid: 456, silence: 0 }, row.mid); },
+    video: async () => ({ latest: oldDate, status: 'inactive' }) };
+  const cached = await inspectRow(row, state, io, now);
+  assert.equal(cached.banChecked, now - 100); assert.equal(calls, 0);
+  const refreshed = await inspectRow(row, state, io, now + 86400000);
+  assert.equal(calls, 1); assert.equal(refreshed.banned, false); assert.equal(refreshed.review, 'pending');
+});
+
+test('removal freshly rechecks banned status and never writes after unban, protection or profile failure', async () => {
+  for (const outcome of ['banned', 'unbanned', 'mutual', 'special', 'error']) {
+    const { row, state, io, events } = fixture();
+    Object.assign(row, { status: 'banned', banned: true, banChecked: Date.now(), latest: null });
+    io.account = async () => {
+      if (outcome === 'error') throw new Error('HTTP 412');
+      return accountStatus({ mid: 456, silence: outcome === 'unbanned' ? 0 : 1 }, row.mid);
+    };
+    io.video = async () => ({ latest: oldDate, status: 'inactive' });
+    io.relation = async () => ({ attribute: outcome === 'mutual' ? 6 : 2, special: outcome === 'special' ? 1 : 0 });
+    if (outcome === 'error') await assert.rejects(removeOne(row, state, io), /412/);
+    else await removeOne(row, state, io);
+    assert.equal(events.includes('write'), outcome === 'banned', outcome);
+    if (outcome === 'unbanned') assert.ok(events.includes('log:skipped-unbanned'));
+  }
+});
+
+test('old checkpoints preserve lists and reviews while requiring a full ban check, only once', () => {
+  const { state, row } = fixture(); state.cursor = 1; delete state.scanRules; state.savedAt = 1000;
+  assert.equal(upgradeScan(state), true);
+  assert.equal(state.cursor, 0); assert.equal(state.complete, false); assert.equal(state.rows[0], row);
+  assert.equal(row.review, 'remove'); assert.equal(state.savedAt, 1000);
+  state.cursor = 1;
+  assert.equal(upgradeScan(state), false); assert.equal(state.cursor, 1);
 });

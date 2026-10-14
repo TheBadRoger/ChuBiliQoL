@@ -27,8 +27,12 @@ const { chromium } = require(process.env.CHUBILI_PLAYWRIGHT_MODULE || 'playwrigh
         const rel = (mid, attribute = 2, special = 0) => ({ mid, uname: `测试 UP ${mid}`, attribute, special });
         if (url.pathname === '/x/web-interface/nav') data = { isLogin: true, mid: 123,
           wbi_img: { img_url: `https://i.test/${'a'.repeat(32)}.png`, sub_url: `https://i.test/${'b'.repeat(32)}.png` } };
-        else if (url.pathname === '/x/relation/followings') data = { total: 5,
-          list: [rel(456), rel(457, 6), rel(458, 2, 1), rel(459), rel(460)] };
+        else if (url.pathname === '/x/relation/followings') data = { total: 7,
+          list: [rel(456), rel(457, 6), rel(458, 2, 1), rel(459), rel(460), rel(461), rel(462, 2, 1)] };
+        else if (url.pathname === '/x/space/wbi/acc/info') {
+          const mid = Number(url.searchParams.get('mid'));
+          data = { mid, silence: [461, 462].includes(mid) ? 1 : 0 };
+        }
         else if (url.pathname === '/x/space/wbi/arc/search') {
           const mid = url.searchParams.get('mid');
           f.activeVideo++; f.maxActiveVideo = Math.max(f.maxActiveVideo, f.activeVideo);
@@ -71,6 +75,22 @@ const { chromium } = require(process.env.CHUBILI_PLAYWRIGHT_MODULE || 'playwrigh
     await page.getByRole('button', { name: '继续扫描', exact: true }).click();
     await status.filter({ hasText: '扫描完成' }).waitFor();
     assert.equal(await page.evaluate(() => window.fixture.requests.filter(p => p === '/x/space/wbi/arc/search').length), 2);
+    const progress = page.getByRole('progressbar', { name: '扫描进度' });
+    assert.equal(await progress.getAttribute('value'), '7');
+    await page.getByText('更多', { exact: true }).click();
+    await page.getByRole('button', { name: '保存进度', exact: true }).click();
+    await page.locator('button:has-text("保存进度"):enabled').waitFor();
+    await load();
+    assert.equal(await progress.getAttribute('value'), '7');
+    assert.equal(await page.getByText(/最近保存/).count(), 1);
+    assert.equal(await page.evaluate(() => window.fixture.requests.length), 0);
+    await page.evaluate(() => { window.fixture.fail = false; });
+    await page.getByRole('combobox', { name: '筛选', exact: true }).selectOption('remove');
+    assert.equal(await page.getByRole('link', { name: '打开 测试 UP 461 投稿页', exact: true }).count(), 1);
+    assert.equal(await page.getByRole('link', { name: '打开 测试 UP 462 投稿页', exact: true }).count(), 0);
+    await page.getByRole('combobox', { name: '筛选', exact: true }).selectOption('banned');
+    assert.equal(await page.getByRole('link').count(), 2);
+    assert.equal(await page.getByText('特别关注保护', { exact: true }).count(), 1);
     await page.getByRole('combobox', { name: '筛选', exact: true }).selectOption('all');
     assert.equal(await page.getByText('互粉永久排除', { exact: true }).count(), 1);
     await page.getByRole('searchbox', { name: '搜索昵称或 UID' }).fill('456');
@@ -105,9 +125,10 @@ const { chromium } = require(process.env.CHUBILI_PLAYWRIGHT_MODULE || 'playwrigh
     assert.ok(mobile.x >= 0 && mobile.x + mobile.width <= 390);
     assert.ok(mobile.y >= 0 && mobile.y + mobile.height <= 844);
     await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.getByRole('combobox', { name: '筛选', exact: true }).selectOption('banned');
     assert.deepEqual(errors, []);
     fs.mkdirSync(path.join(__dirname, '..', 'artifacts'), { recursive: true });
     await page.screenshot({ path: path.join(__dirname, '..', 'artifacts', 'panel.png') });
-    console.log('PASS: compact/mobile panel, collapsed tools, scan, 412 pause, IndexedDB resume, protections, review/removal, log export and parallel option.');
+    console.log('PASS: compact/mobile panel, banned review/badges/protection, manual save and reload, 412 resume, review/removal, log export and parallel scan.');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChuBiliQoL
 // @namespace    https://github.com/TheBadRoger/ChuBiliQoL
-// @version      0.2.0
-// @description  关注审核、半年未投稿筛选、断点续扫与安全取关
+// @version      0.3.0
+// @description  关注审核、停更和封禁筛选、断点续扫与安全取关
 // @author       TheBadRoger
 // @license      MIT
 // @homepageURL  https://github.com/TheBadRoger/ChuBiliQoL
@@ -49,11 +49,19 @@
     const latest = Math.max(...dates);
     return { latest, status: latest < cutoff(now) ? 'inactive' : 'active' };
   }
+  function accountStatus(data, mid, now = Date.now()) {
+    if (!data || uid(data.mid) !== uid(mid) || ![0, 1].includes(data.silence)) throw new Error('账号封禁状态字段不完整，已暂停');
+    return { banned: data.silence === 1, banChecked: now };
+  }
+  function protectedRow(row, state) {
+    return row.attribute === 6 || state.excluded.includes(row.mid) || (state.protectSpecial && row.special === 1);
+  }
+  function candidate(row) {
+    return (row.status === 'banned' && row.banned === true && Number.isFinite(row.banChecked) && row.banChecked > 0) ||
+      (row.status === 'inactive' && Number.isFinite(row.latest) && row.latest > 0 && row.latest < cutoff());
+  }
   function eligible(row, state) {
-    return state.complete && row.status === 'inactive' && row.review === 'remove' &&
-      row.attribute === 2 && !state.excluded.includes(row.mid) &&
-      (!state.protectSpecial || row.special === 0) &&
-      Number.isFinite(row.latest) && row.latest > 0 && row.latest < cutoff();
+    return state.complete && candidate(row) && row.review === 'remove' && row.attribute === 2 && !protectedRow(row, state);
   }
   function cachedVideo(row, now = Date.now()) {
     const age = now - row.checked;
@@ -129,8 +137,27 @@
     return body.data;
   }
   function freshState(account) {
-    return { version: 1, account, rows: [], excluded: [], protectSpecial: true, scanConcurrency: 1,
+    return { version: 1, scanRules: 2, account, rows: [], excluded: [], protectSpecial: true, scanConcurrency: 1,
       page: 1, total: null, listed: false, complete: false, cursor: 0, message: '尚未扫描' };
+  }
+  function upgradeScan(state) {
+    if (state.scanRules === 2) return false;
+    state.scanRules = 2;
+    state.cursor = 0;
+    state.complete = false;
+    state.message = '已保留原有列表和审核，请继续扫描以补查封禁状态';
+    return true;
+  }
+  async function inspectRow(row, state, io, now = Date.now()) {
+    const age = now - row.banChecked;
+    const account = typeof row.banned === 'boolean' && age >= 0 && age < DAY ?
+      { banned: row.banned, banChecked: row.banChecked } : await io.account(row.mid);
+    if (account.banned) return { ...account, status: 'banned', latest: null, checked: 0,
+      review: row.review === 'keep' || protectedRow(row, state) ? 'keep' : 'remove' };
+    if (protectedRow(row, state)) return { ...account, status: 'protected' };
+    const cached = cachedVideo(row, now);
+    return { ...account, ...(cached || { ...await io.video(row.mid), checked: Date.now() }),
+      review: row.status === 'banned' ? 'pending' : row.review };
   }
 
   function requestGate({ interval, wait, check, now = Date.now }) {
@@ -175,12 +202,14 @@
   async function removeOne(row, state, io) {
     io.checkStop();
     await io.identity();
-    Object.assign(row, await io.video(row.mid), { checked: Date.now() });
+    const wasBanned = row.status === 'banned';
+    Object.assign(row, await io.account(row.mid));
+    Object.assign(row, row.banned ? { status: 'banned', latest: null } : await io.video(row.mid), { checked: Date.now() });
     Object.assign(row, relation(await io.relation(row.mid)));
     if (row.attribute === 6 && !state.excluded.includes(row.mid)) state.excluded.push(row.mid);
-    if (!eligible(row, state)) {
+    if ((wasBanned && !row.banned) || !eligible(row, state)) {
       row.review = 'keep';
-      await io.save(); await io.log(row.mid, 'skipped-protected-or-active');
+      await io.save(); await io.log(row.mid, wasBanned && !row.banned ? 'skipped-unbanned' : 'skipped-protected-or-active');
       return;
     }
     io.checkStop();
@@ -202,7 +231,7 @@
 
   // The exact same functions are exercised by Node's dependency-free test runner.
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { uid, cutoff, relation, latestVideo, eligible, cachedVideo, mergeReview, md5, wbiKey, sign, parseResponse, freshState, removeOne, requestGate, scanRows };
+    module.exports = { uid, cutoff, relation, latestVideo, accountStatus, protectedRow, candidate, eligible, cachedVideo, mergeReview, md5, wbiKey, sign, parseResponse, freshState, upgradeScan, inspectRow, removeOne, requestGate, scanRows };
     return;
   }
   if (window.top !== window.self) return;
@@ -211,9 +240,9 @@
   const cookie = name => document.cookie.split('; ').find(s => s.startsWith(`${name}=`))?.slice(name.length + 1);
   let db, state, root, busy = false, stopping = false, scanning = false, requestError, identityTask, key = '', keyTime = 0;
   const selected = new Set();
-  let query = '', filter = 'inactive', sort = 'latest', page = 0, moreOpen = false;
+  let query = '', filter = 'candidates', sort = 'latest', page = 0, moreOpen = false;
   const labels = { inactive: '半年未投稿', active: '近期投稿', empty: '无可见视频（人工判断）',
-    protected: '受保护', pending: '未扫描', removed: '已取关', uncertain: '操作结果待核实' };
+    protected: '受保护', banned: '已封禁', pending: '未扫描', removed: '已取关', uncertain: '操作结果待核实' };
 
   function openDB() {
     return new Promise((resolve, reject) => {
@@ -235,7 +264,11 @@
       tx.onerror = tx.onabort = () => reject(new Error('本地数据保存失败；已停止操作'));
     });
   }
-  const save = () => store('state', 'readwrite', s => s.put(state));
+  const save = async () => {
+    const savedAt = Date.now();
+    await store('state', 'readwrite', s => s.put({ ...state, savedAt }));
+    state.savedAt = savedAt;
+  };
   const log = (mid, result, operation) => store('logs', 'readwrite', s => s.add({
     account: state.account, mid, result, operation, time: new Date().toISOString()
   }));
@@ -281,6 +314,10 @@
     if (!key || Date.now() - keyTime > 30000) await identity();
     return latestVideo(await api('/x/space/wbi/arc/search', sign({ mid, pn: 1, ps: 30, order: 'pubdate' }, key)));
   }
+  async function account(mid) {
+    if (!key || Date.now() - keyTime > 30000) await identity();
+    return accountStatus(await api('/x/space/wbi/acc/info', sign({ mid }, key)), mid);
+  }
   function rememberMutual(row) {
     if (row.attribute === 6 && !state.excluded.includes(row.mid)) state.excluded.push(row.mid);
   }
@@ -310,7 +347,7 @@
         const old = previous.get(mid);
         return { mid, name: String(item.uname || mid).slice(0, 100), ...rel,
           review: old?.review === 'keep' ? 'keep' : 'pending', status: 'pending',
-          latest: old?.latest ?? null, checked: old?.checked ?? 0 };
+          latest: old?.latest ?? null, checked: old?.checked ?? 0, banned: old?.banned, banChecked: old?.banChecked ?? 0 };
       });
       if (state.rows.length + additions.length > data.total || (!additions.length && state.rows.length < data.total)) throw new Error('关注分页不完整，请重新扫描');
       state.total = data.total;
@@ -324,11 +361,7 @@
     scanning = true;
     try {
       await scanRows(state, state.scanConcurrency, { checkStop,
-        inspect: async row => {
-          if (state.excluded.includes(row.mid) || (state.protectSpecial && row.special === 1)) return { status: 'protected' };
-          const cached = cachedVideo(row);
-          return cached || { ...await video(row.mid), checked: Date.now() };
-        },
+        inspect: row => inspectRow(row, state, { account, video }),
         save: async () => { state.message = `已扫描 ${state.cursor} / ${state.rows.length}`; await save(); },
         progress: render, stop: error => { requestError ||= error; }
       });
@@ -340,11 +373,11 @@
   }
   async function removeReviewed() {
     const targets = state.rows.filter(r => selected.has(r.mid) && eligible(r, state));
-    if (!targets.length) throw new Error('请选择已人工标记为待取关的半年未投稿账号');
+    if (!targets.length) throw new Error('请选择待取关的停更或封禁账号；保留和受保护项不能取关');
     if (!confirm(`将取关选中的 ${targets.length} 个账号。操作不可自动撤销，请先核对投稿页与保留名单。`)) return;
     if (prompt(`二次确认：请输入“取关 ${targets.length}”继续`) !== `取关 ${targets.length}`) return;
     for (const row of targets) {
-      await removeOne(row, state, { checkStop, identity, video, save, log,
+      await removeOne(row, state, { checkStop, identity, account, video, save, log,
         relation: mid => api('/x/relation', { fid: mid }), operation: () => crypto.randomUUID(),
         write: mid => {
           const csrf = cookie('bili_jct');
@@ -367,6 +400,7 @@
         try {
           assertAccount();
           state = await store('state', 'readonly', s => s.get(state.account)) || state;
+          if (upgradeScan(state)) await save();
           render();
           await action();
         } catch (error) {
@@ -389,7 +423,8 @@
   function visibleRows() {
     const q = query.toLocaleLowerCase();
     return state.rows.filter(r => (!q || `${r.name} ${r.mid}`.toLocaleLowerCase().includes(q)) &&
-      (filter === 'all' || (filter === 'keep' || filter === 'remove' ? r.review === filter : r.status === filter)))
+      (filter === 'all' || (filter === 'candidates' ? candidate(r) :
+        filter === 'banned' ? r.banned === true : filter === 'keep' || filter === 'remove' ? r.review === filter : r.status === filter)))
       .sort((a, b) => sort === 'name' ? a.name.localeCompare(b.name, 'zh-CN') :
         sort === 'uid' ? Number(a.mid) - Number(b.mid) : (a.latest ?? Infinity) - (b.latest ?? Infinity));
   }
@@ -414,7 +449,7 @@
     const panel = el('section', undefined, { role: 'dialog', ariaLabel: 'ChuBiliQoL 关注管理' });
     const header = el('header');
     const headerActions = el('div', undefined, { className: 'tools' });
-    headerActions.append(button(busy ? '暂停' : '继续扫描', () => {
+    headerActions.append(button(busy ? '暂停并保存' : '继续扫描', () => {
       if (busy) { stopping = true; state.message = '正在暂停，等待已发出的请求结束'; render(); }
       else exclusive(() => scan());
     }, busy && stopping), button('收起', () => { root.host.hidden = true; }, false));
@@ -440,6 +475,10 @@
     parallelLabel.append(parallel, el('span', '双路并行扫描')); tools.append(parallelLabel);
     more.append(tools);
     panel.append(el('div', state.message, { className: 'notice', role: 'status', ariaLive: 'polite' }));
+    const progress = el('progress', undefined, { max: Math.max(1, state.rows.length), value: state.cursor,
+      ariaLabel: '扫描进度', title: `连续完成 ${state.cursor} / ${state.rows.length}` });
+    progress.style.cssText = 'width:100%;height:5px;accent-color:#80d4ff;flex-shrink:0';
+    panel.append(progress, el('small', `${state.listed ? `扫描 ${state.cursor} / ${state.rows.length}` : `已获取关注 ${state.rows.length} / ${state.total ?? '?'}`} · ${state.savedAt ? `最近保存 ${new Date(state.savedAt).toLocaleTimeString()}` : '尚未保存'}`));
     const searchTools = el('div', undefined, { className: 'tools' });
     const search = el('input', undefined, { id: 'search', type: 'search', placeholder: '搜索昵称 / UID', value: query, ariaLabel: '搜索昵称或 UID' });
     search.oninput = () => { query = search.value; page = 0; render(); };
@@ -449,7 +488,7 @@
       select.onchange = () => { callback(select.value); page = 0; render(); };
       return select;
     };
-    searchTools.append(search, makeSelect([['inactive', '半年未投稿'], ['all', '全部关注'], ['protected', '受保护'], ['empty', '无可见视频'], ['pending', '未扫描'], ['keep', '已保留'], ['remove', '待取关'], ['uncertain', '待核实'], ['removed', '已取关']], filter, v => { filter = v; }, '筛选'),
+    searchTools.append(search, makeSelect([['candidates', '停更 / 封禁'], ['inactive', '半年未投稿'], ['banned', '已封禁'], ['all', '全部关注'], ['protected', '受保护'], ['empty', '无可见视频'], ['pending', '未扫描'], ['keep', '已保留'], ['remove', '待取关'], ['uncertain', '待核实'], ['removed', '已取关']], filter, v => { filter = v; }, '筛选'),
       makeSelect([['latest', '投稿时间：旧 → 新'], ['name', '昵称'], ['uid', 'UID']], sort, v => { sort = v; }, '排序'));
     panel.append(searchTools);
     const visible = visibleRows();
@@ -458,14 +497,14 @@
     const batch = el('div', undefined, { className: 'tools' });
     const setReview = review => exclusive(async () => {
       for (const row of state.rows) if (selected.has(row.mid)) {
-        if (review !== 'remove' || (row.status === 'inactive' && row.attribute === 2 &&
-          !state.excluded.includes(row.mid) && (!state.protectSpecial || !row.special))) row.review = review;
+        if (review !== 'remove' || (candidate(row) && row.attribute === 2 && !protectedRow(row, state))) row.review = review;
       }
       await save();
     });
     batch.append(button('选择本页', () => { current.forEach(r => selected.add(r.mid)); render(); }),
       button('批量保留', () => setReview('keep')), button('标记待取关', () => setReview('remove')));
-    tools.append(button('清空选择', () => { selected.clear(); render(); }), button('恢复待审核', () => setReview('pending')));
+    tools.append(button('清空选择', () => { selected.clear(); render(); }), button('恢复待审核', () => setReview('pending')),
+      button('保存进度', () => exclusive(async () => { await save(); })));
     const remove = button('取关选中审核项', () => exclusive(removeReviewed), busy || !state.complete);
     remove.className = 'danger'; batch.append(remove); panel.append(batch);
     const scroll = el('div', undefined, { className: 'scroll' });
@@ -480,8 +519,13 @@
       selectCell.append(cb);
       const name = el('td');
       name.append(el('a', row.name, { href: `https://space.bilibili.com/${row.mid}/upload/video`, target: '_blank', rel: 'noopener noreferrer', ariaLabel: `打开 ${row.name} 投稿页` }), el('small', row.mid));
+      if (row.banned) {
+        const badge = el('small', '已封禁', { title: '用户信息接口明确返回 silence = 1；取关前会重新验证' });
+        badge.style.cssText = 'display:inline-block;color:#ffd0d4;background:#783841;border-radius:4px;padding:0 5px';
+        name.append(badge);
+      }
       tr.append(selectCell, name, el('td', row.latest ? new Date(row.latest).toLocaleDateString() : '—'),
-        el('td', state.excluded.includes(row.mid) ? '互粉永久排除' : labels[row.status] || row.status),
+        el('td', state.excluded.includes(row.mid) ? '互粉永久排除' : state.protectSpecial && row.special === 1 ? '特别关注保护' : labels[row.status] || row.status),
         el('td', { pending: '待审核', keep: '保留', remove: '待取关' }[row.review]));
       body.append(tr);
     }
@@ -514,6 +558,7 @@
     if (!account) { alert('请先登录 Bilibili，再打开关注管理'); return; }
     db ||= await openDB();
     state = await store('state', 'readonly', s => s.get(uid(account))) || freshState(uid(account));
+    upgradeScan(state);
     if (!root) {
       const host = el('div'); document.body.append(host); root = host.attachShadow({ mode: 'closed' });
     }
